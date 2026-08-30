@@ -1,6 +1,9 @@
 // main.cpp
-// Days 1-3 merged: VectorItem/VectorStore (brute-force, cosine similarity)
-//                   + KDTree (pruned k-NN, Euclidean distance)
+// Days 1-6 merged:
+//   - VectorItem/VectorStore (brute-force, cosine similarity)
+//   - KDTree (pruned k-NN, Euclidean distance)
+//   - HNSWIndex (multilayer graph: insert + search)
+//   - Benchmark comparing all three on a synthetic dataset
 
 #include <iostream>
 #include <vector>
@@ -13,6 +16,8 @@
 #include <random>
 #include <queue>
 #include <unordered_set>
+#include <chrono>
+#include <set>
 
 // ============================================================
 // Day 1-2: VectorItem, distance metrics, VectorStore (brute-force)
@@ -206,11 +211,7 @@ public:
 };
 
 // ============================================================
-// main(): demo both structures on the same toy dataset
-// ============================================================
-
-// ============================================================
-// Day 5: HNSWIndex — insertion / multilayer graph construction
+// Day 5-6: HNSWIndex — insertion (Day 5) + search (Day 6)
 // ============================================================
 
 class HNSWIndex {
@@ -222,6 +223,12 @@ public:
         std::vector<std::vector<int>> neighbors; // neighbors[layer] = list of node ids
     };
 
+    struct HNSWResult {
+        int id;
+        std::string label;
+        float score; // cosine similarity, higher = better
+    };
+
 private:
     std::vector<Node> nodes;
     int entryPoint = -1;
@@ -231,21 +238,17 @@ private:
     std::mt19937 rng;
     std::uniform_real_distribution<float> uniform01;
 
-    // Distance = 1 - cosine similarity, so smaller = more similar (standard "distance" convention)
     float distance(const std::vector<float>& a, const std::vector<float>& b) const {
         return 1.0f - cosineSimilarity(a, b);
     }
 
-    // Random layer assignment, exponentially decaying (mirrors skip-list promotion)
     int randomLevel() {
         double r = uniform01(rng);
-        if (r <= 0.0) r = 1e-9;  // guard against log(0)
+        if (r <= 0.0) r = 1e-9;
         double levelLambda = 1.0 / std::log(1.0 * M);
         return static_cast<int>(-std::log(r) * levelLambda);
     }
 
-    // Greedy search on ONE layer. Returns up to `ef` closest nodes found, ascending distance.
-    // Reused by both insert() (ef=efConstruction) and, on Day 6, search() (ef=user-supplied).
     std::vector<std::pair<float,int>> searchLayer(const std::vector<float>& query,
                                                      std::vector<int> entryPoints,
                                                      int ef, int layer) const {
@@ -268,7 +271,6 @@ private:
             int curId = curPair.second;
             candidates.pop();
 
-            // Stop condition: current candidate is worse than our worst "best" AND we have enough results
             if (!best.empty() && curDist > best.top().first && best.size() >= static_cast<size_t>(ef)) {
                 break;
             }
@@ -283,20 +285,17 @@ private:
                 if (best.size() < static_cast<size_t>(ef) || d < best.top().first) {
                     candidates.push({d, neighborId});
                     best.push({d, neighborId});
-                    if (best.size() > static_cast<size_t>(ef)) best.pop();  // evict worst
+                    if (best.size() > static_cast<size_t>(ef)) best.pop();
                 }
             }
         }
 
         std::vector<std::pair<float,int>> result;
         while (!best.empty()) { result.push_back(best.top()); best.pop(); }
-        std::reverse(result.begin(), result.end());  // was max-heap order, flip to ascending
+        std::reverse(result.begin(), result.end());
         return result;
     }
 
-    // Simple neighbor selection heuristic: just keep the closest `maxM` candidates.
-    // (There's a smarter "heuristic" version in the original HNSW paper that favors diverse
-    // directions, not just closest — worth mentioning in interviews, see Q7 below.)
     std::vector<int> selectNeighborsSimple(std::vector<std::pair<float,int>> candidates, int maxM) const {
         std::sort(candidates.begin(), candidates.end());
         std::vector<int> result;
@@ -321,7 +320,6 @@ public:
         node.neighbors.resize(level + 1);
         nodes.push_back(node);
 
-        // First node ever inserted: just becomes the entry point, nothing to connect to.
         if (entryPoint == -1) {
             entryPoint = id;
             maxLayer = level;
@@ -330,25 +328,20 @@ public:
 
         int curEntry = entryPoint;
 
-        // Phase 1: descend from top layer to (level+1), cheap greedy 1-NN search each time,
-        // just to find a good starting point for the real work below.
         for (int lc = maxLayer; lc > level; lc--) {
             auto results = searchLayer(values, {curEntry}, 1, lc);
             if (!results.empty()) curEntry = results[0].second;
         }
 
-        // Phase 2: from min(level, maxLayer) down to 0, find real candidates and wire up edges.
         for (int lc = std::min(level, maxLayer); lc >= 0; lc--) {
             auto candidates = searchLayer(values, {curEntry}, efConstruction, lc);
             int maxConn = (lc == 0) ? (2 * M) : M;
             auto selected = selectNeighborsSimple(candidates, maxConn);
 
-            // Bidirectional connections: new node <-> each selected neighbor
             nodes[id].neighbors[lc] = selected;
             for (int neighborId : selected) {
                 nodes[neighborId].neighbors[lc].push_back(id);
 
-                // If that neighbor is now over capacity, prune it back down to its closest maxConn
                 if ((int)nodes[neighborId].neighbors[lc].size() > maxConn) {
                     std::vector<std::pair<float,int>> nCandidates;
                     for (int nb : nodes[neighborId].neighbors[lc]) {
@@ -361,11 +354,35 @@ public:
             if (!candidates.empty()) curEntry = candidates[0].second;
         }
 
-        // New node reaches higher than anything seen before -> it's the new entry point.
         if (level > maxLayer) {
             maxLayer = level;
             entryPoint = id;
         }
+    }
+
+    // Day 6: k-NN search. ef controls recall/speed tradeoff at query time (ef >= k recommended).
+    std::vector<HNSWResult> search(const std::vector<float>& query, int k, int ef) const {
+        if (entryPoint == -1) return {};
+
+        int curEntry = entryPoint;
+
+        // Descend greedily from top layer down to layer 1 (ef=1, cheap)
+        for (int lc = maxLayer; lc > 0; lc--) {
+            auto results = searchLayer(query, {curEntry}, 1, lc);
+            if (!results.empty()) curEntry = results[0].second;
+        }
+
+        // Final thorough search at layer 0, using the user-supplied ef
+        int effectiveEf = std::max(ef, k);
+        auto candidates = searchLayer(query, {curEntry}, effectiveEf, 0);
+
+        std::vector<HNSWResult> results;
+        for (int i = 0; i < std::min((int)candidates.size(), k); i++) {
+            int id = candidates[i].second;
+            float dist = candidates[i].first;
+            results.push_back({id, nodes[id].label, 1.0f - dist});
+        }
+        return results;
     }
 
     size_t size() const { return nodes.size(); }
@@ -384,55 +401,95 @@ public:
     }
 };
 
+// ============================================================
+// Day 6: Benchmark — brute-force vs KD-Tree vs HNSW, larger synthetic dataset
+// ============================================================
+
+std::vector<float> randomVector(std::mt19937& rng, int dim) {
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> v(dim);
+    for (int i = 0; i < dim; i++) v[i] = dist(rng);
+    return v;
+}
+
 int main() {
-    // ---- Brute-force (VectorStore) ----
+    const int N = 5000;      // number of vectors
+    const int DIM = 64;      // dimensions per vector
+    const int K = 10;        // top-K to retrieve
+
+    std::mt19937 rng(123);
+
+    // Generate synthetic dataset
+    std::vector<std::vector<float>> dataset;
+    dataset.reserve(N);
+    for (int i = 0; i < N; i++) dataset.push_back(randomVector(rng, DIM));
+
+    // Build all three structures on the same data
     VectorStore store;
-    store.insert("CS",     {0.9f, 0.8f, 0.1f, 0.1f});
-    store.insert("Math",   {0.85f, 0.75f, 0.15f, 0.05f});
-    store.insert("Food",   {0.1f, 0.1f, 0.9f, 0.8f});
-    store.insert("Sports", {0.2f, 0.1f, 0.1f, 0.9f});
-    store.insert("Art",    {0.3f, 0.6f, 0.4f, 0.2f});
+    std::vector<KDPoint> kdPoints;
+    HNSWIndex hnsw(/*M=*/16, /*efConstruction=*/100, /*seed=*/42);
 
-    std::vector<float> query = {0.88f, 0.79f, 0.12f, 0.08f};
-
-    auto bruteResults = store.bruteForceSearch(query, 2);
-    std::cout << "[Brute-Force / cosine] Top " << bruteResults.size() << " matches:\n";
-    for (const auto& r : bruteResults) {
-        std::cout << "  [" << r.id << "] " << r.label
-                  << "  (cosine similarity: " << r.score << ")\n";
+    for (int i = 0; i < N; i++) {
+        std::string label = "vec" + std::to_string(i);
+        store.insert(label, dataset[i]);
+        kdPoints.push_back({i, label, dataset[i]});
+        hnsw.insert(label, dataset[i]);
     }
+
+    KDTree kdtree;
+    kdtree.build(kdPoints);
+
+    // Query vector: a fresh random vector, not one already in the dataset
+    std::vector<float> query = randomVector(rng, DIM);
+
+    // ---- Brute-force (ground truth) ----
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto bruteResults = store.bruteForceSearch(query, K);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double bruteMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // ---- KD-Tree ----
-    std::vector<KDPoint> points = {
-        {0, "CS",     {0.9f, 0.8f, 0.1f, 0.1f}},
-        {1, "Math",   {0.85f, 0.75f, 0.15f, 0.05f}},
-        {2, "Food",   {0.1f, 0.1f, 0.9f, 0.8f}},
-        {3, "Sports", {0.2f, 0.1f, 0.1f, 0.9f}},
-        {4, "Art",    {0.3f, 0.6f, 0.4f, 0.2f}},
-    };
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto kdResults = kdtree.kNearest(query, K);
+    auto t3 = std::chrono::high_resolution_clock::now();
+    double kdMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-    KDTree tree;
-    tree.build(points);
+    // ---- HNSW ----
+    auto t4 = std::chrono::high_resolution_clock::now();
+    auto hnswResults = hnsw.search(query, K, /*ef=*/50);
+    auto t5 = std::chrono::high_resolution_clock::now();
+    double hnswMs = std::chrono::duration<double, std::milli>(t5 - t4).count();
 
-    auto kdResults = tree.kNearest(query, 2);
-    std::cout << "\n[KD-Tree / euclidean] Top " << kdResults.size() << " matches:\n";
-    for (const auto& r : kdResults) {
-        std::cout << "  [" << r.id << "] " << r.label << "\n";
+    // ---- Recall: what fraction of brute-force's true top-K did HNSW find? ----
+    std::set<int> groundTruthIds;
+    for (const auto& r : bruteResults) groundTruthIds.insert(r.id);
+
+    int hits = 0;
+    for (const auto& r : hnswResults) {
+        if (groundTruthIds.count(r.id)) hits++;
     }
+    double recall = (double)hits / (double)K;
 
-        // ---- HNSW ----
-    HNSWIndex index(/*M=*/4, /*efConstruction=*/50, /*seed=*/42);
+    // ---- Report ----
+    std::cout << "Dataset: " << N << " vectors, " << DIM << " dimensions, K=" << K << "\n\n";
 
-    index.insert("CS",      {0.9f, 0.8f, 0.1f, 0.1f});
-    index.insert("Math",    {0.85f, 0.75f, 0.15f, 0.05f});
-    index.insert("Food",    {0.1f, 0.1f, 0.9f, 0.8f});
-    index.insert("Sports",  {0.2f, 0.1f, 0.1f, 0.9f});
-    index.insert("Art",     {0.3f, 0.6f, 0.4f, 0.2f});
-    index.insert("Physics", {0.8f, 0.85f, 0.05f, 0.1f});
+    std::cout << "[Brute-Force] " << bruteMs << " ms\n";
+    std::cout << "  Top 3 IDs: ";
+    for (int i = 0; i < 3 && i < (int)bruteResults.size(); i++) std::cout << bruteResults[i].id << " ";
+    std::cout << "\n\n";
 
-    std::cout << "\n[HNSW] Inserted " << index.size() << " nodes.\n";
-    std::cout << "Entry point: " << index.getEntryPoint() << ", max layer: " << index.getMaxLayer() << "\n\n";
-    index.printGraph();
+    std::cout << "[KD-Tree]    " << kdMs << " ms\n";
+    std::cout << "  Top 3 IDs: ";
+    for (int i = 0; i < 3 && i < (int)kdResults.size(); i++) std::cout << kdResults[i].id << " ";
+    std::cout << "\n\n";
+
+    std::cout << "[HNSW]       " << hnswMs << " ms\n";
+    std::cout << "  Top 3 IDs: ";
+    for (int i = 0; i < 3 && i < (int)hnswResults.size(); i++) std::cout << hnswResults[i].id << " ";
+    std::cout << "\n";
+    std::cout << "  Recall@" << K << " vs brute-force ground truth: " << (recall * 100.0) << "%\n\n";
+
+    std::cout << "Speedup (brute-force / HNSW): " << (bruteMs / hnswMs) << "x\n";
 
     return 0;
 }
