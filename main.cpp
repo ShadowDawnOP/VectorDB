@@ -1,13 +1,112 @@
 // main.cpp
-// Day 3: KD-Tree implementation (standalone class, alongside VectorStore/BruteForce from Days 1-2)
+// Days 1-3 merged: VectorItem/VectorStore (brute-force, cosine similarity)
+//                   + KDTree (pruned k-NN, Euclidean distance)
 
 #include <iostream>
 #include <vector>
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 #include <memory>
 #include <limits>
+
+// ============================================================
+// Day 1-2: VectorItem, distance metrics, VectorStore (brute-force)
+// ============================================================
+
+struct VectorItem {
+    int id;
+    std::string label;
+    std::vector<float> values;
+
+    VectorItem(int id_, std::string label_, std::vector<float> values_)
+        : id(id_), label(std::move(label_)), values(std::move(values_)) {}
+};
+
+float euclideanDistance(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) throw std::invalid_argument("Dimension mismatch");
+    float sum = 0.0f;
+    for (size_t i = 0; i < a.size(); i++) {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return std::sqrt(sum);
+}
+
+float manhattanDistance(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) throw std::invalid_argument("Dimension mismatch");
+    float sum = 0.0f;
+    for (size_t i = 0; i < a.size(); i++) {
+        sum += std::fabs(a[i] - b[i]);
+    }
+    return sum;
+}
+
+float dotProduct(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) throw std::invalid_argument("Dimension mismatch");
+    float sum = 0.0f;
+    for (size_t i = 0; i < a.size(); i++) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+float magnitude(const std::vector<float>& a) {
+    return std::sqrt(dotProduct(a, a));
+}
+
+float cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) {
+    float magA = magnitude(a);
+    float magB = magnitude(b);
+    if (magA == 0.0f || magB == 0.0f) return 0.0f;
+    return dotProduct(a, b) / (magA * magB);
+}
+
+struct SearchResult {
+    int id;
+    std::string label;
+    float score;
+};
+
+class VectorStore {
+private:
+    std::vector<VectorItem> items;
+    int nextId = 0;
+
+public:
+    int insert(const std::string& label, const std::vector<float>& values) {
+        int id = nextId++;
+        items.emplace_back(id, label, values);
+        return id;
+    }
+
+    size_t size() const { return items.size(); }
+
+    std::vector<SearchResult> bruteForceSearch(const std::vector<float>& query, int k) const {
+        std::vector<SearchResult> results;
+        results.reserve(items.size());
+
+        for (const auto& item : items) {
+            float score = cosineSimilarity(query, item.values);
+            results.push_back({item.id, item.label, score});
+        }
+
+        std::sort(results.begin(), results.end(),
+                  [](const SearchResult& a, const SearchResult& b) {
+                      return a.score > b.score;
+                  });
+
+        if (results.size() > static_cast<size_t>(k)) {
+            results.resize(k);
+        }
+        return results;
+    }
+};
+
+// ============================================================
+// Day 3: KDTree (Euclidean distance, pruned k-NN search)
+// ============================================================
 
 struct KDPoint {
     int id;
@@ -38,13 +137,10 @@ private:
         return sum;
     }
 
-    // Recursively build a balanced KD-Tree from a list of points.
     std::unique_ptr<KDNode> buildRecursive(std::vector<KDPoint>& points, int start, int end, int depth) {
         if (start >= end) return nullptr;
 
         int dim = depth % dimensions;
-
-        // Sort the slice by this dimension's value, pick the median as the node.
         int mid = start + (end - start) / 2;
         std::nth_element(points.begin() + start, points.begin() + mid, points.begin() + end,
                           [dim](const KDPoint& a, const KDPoint& b) {
@@ -57,7 +153,6 @@ private:
         return node;
     }
 
-    // Best-so-far tracking during search: (squared distance, point)
     struct BestMatch {
         float distSq;
         KDPoint point;
@@ -69,7 +164,6 @@ private:
 
         float distSq = squaredEuclidean(query, node->point.values);
 
-        // Insert into best-list, keep it sorted, trim to size k
         best.push_back({distSq, node->point});
         std::sort(best.begin(), best.end(),
                   [](const BestMatch& a, const BestMatch& b) { return a.distSq < b.distSq; });
@@ -78,14 +172,11 @@ private:
         int dim = node->splitDim;
         float diff = query[dim] - node->point.values[dim];
 
-        // Decide which side to search first (the side the query "belongs" to)
         const KDNode* nearSide = (diff < 0) ? node->left.get() : node->right.get();
         const KDNode* farSide  = (diff < 0) ? node->right.get() : node->left.get();
 
         searchRecursive(nearSide, query, best, k);
 
-        // Pruning check: only explore the far side if it could possibly contain
-        // something closer than our current worst "best" match.
         float worstBestDist = (best.size() < static_cast<size_t>(k))
                                    ? std::numeric_limits<float>::max()
                                    : best.back().distSq;
@@ -111,7 +202,29 @@ public:
     }
 };
 
+// ============================================================
+// main(): demo both structures on the same toy dataset
+// ============================================================
+
 int main() {
+    // ---- Brute-force (VectorStore) ----
+    VectorStore store;
+    store.insert("CS",     {0.9f, 0.8f, 0.1f, 0.1f});
+    store.insert("Math",   {0.85f, 0.75f, 0.15f, 0.05f});
+    store.insert("Food",   {0.1f, 0.1f, 0.9f, 0.8f});
+    store.insert("Sports", {0.2f, 0.1f, 0.1f, 0.9f});
+    store.insert("Art",    {0.3f, 0.6f, 0.4f, 0.2f});
+
+    std::vector<float> query = {0.88f, 0.79f, 0.12f, 0.08f};
+
+    auto bruteResults = store.bruteForceSearch(query, 2);
+    std::cout << "[Brute-Force / cosine] Top " << bruteResults.size() << " matches:\n";
+    for (const auto& r : bruteResults) {
+        std::cout << "  [" << r.id << "] " << r.label
+                  << "  (cosine similarity: " << r.score << ")\n";
+    }
+
+    // ---- KD-Tree ----
     std::vector<KDPoint> points = {
         {0, "CS",     {0.9f, 0.8f, 0.1f, 0.1f}},
         {1, "Math",   {0.85f, 0.75f, 0.15f, 0.05f}},
@@ -123,11 +236,9 @@ int main() {
     KDTree tree;
     tree.build(points);
 
-    std::vector<float> query = {0.88f, 0.79f, 0.12f, 0.08f};
-    auto results = tree.kNearest(query, 2);
-
-    std::cout << "KD-Tree top " << results.size() << " nearest (by Euclidean distance):\n";
-    for (const auto& r : results) {
+    auto kdResults = tree.kNearest(query, 2);
+    std::cout << "\n[KD-Tree / euclidean] Top " << kdResults.size() << " matches:\n";
+    for (const auto& r : kdResults) {
         std::cout << "  [" << r.id << "] " << r.label << "\n";
     }
 
