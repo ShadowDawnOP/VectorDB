@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VectorDB — Search UI</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #1a1d27;
+    --border: #2a2e3a;
+    --text: #e4e6eb;
+    --muted: #8b8f9c;
+    --accent: #6ea8fe;
+    --accent2: #f4a261;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 20px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0f1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  button {
+    margin-top: 12px;
+    padding: 9px 14px;
+    background: var(--accent);
+    color: #0f1117;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    width: 100%;
+  }
+  button:hover { opacity: 0.9; }
+  button.secondary { background: var(--border); color: var(--text); }
+  .status { font-size: 12px; margin-top: 10px; color: var(--muted); min-height: 16px; }
+  .status.error { color: #f87171; }
+  .status.success { color: #4ade80; }
+  canvas {
+    width: 100%;
+    height: 420px;
+    background: #0f1117;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    display: block;
+  }
+  .results { margin-top: 16px; }
+  .result-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 10px;
+    background: #0f1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .result-item .score { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .count-badge {
+    display: inline-block;
+    background: var(--border);
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--muted);
+    margin-left: 8px;
+  }
+</style>
+</head>
+<body>
+
+<h1>VectorDB <span id="countBadge" class="count-badge">0 vectors</span></h1>
+<div class="sub">Talking to your C++ REST API at <code>http://localhost:8080</code></div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Insert a vector</h2>
+      <label>Label</label>
+      <input id="insertLabel" type="text" placeholder="e.g. CS">
+      <label>Values (comma-separated)</label>
+      <input id="insertValues" type="text" placeholder="e.g. 0.9, 0.8, 0.1, 0.1">
+      <button onclick="doInsert()">Insert</button>
+      <button class="secondary" onclick="loadSampleData()">Load sample dataset</button>
+      <div id="insertStatus" class="status"></div>
+    </div>
+
+    <div class="panel" style="margin-top:16px;">
+      <h2>Search</h2>
+      <label>Query values (comma-separated)</label>
+      <input id="searchValues" type="text" placeholder="e.g. 0.88, 0.79, 0.12, 0.08">
+      <label>Top K</label>
+      <input id="searchK" type="text" value="3">
+      <button onclick="doSearch()">Search</button>
+      <div id="searchStatus" class="status"></div>
+      <div id="resultsList" class="results"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Vector space (PCA, projected to 2D)</h2>
+    <canvas id="plot"></canvas>
+    <div class="sub" style="margin-top:8px;">
+      Blue = stored vectors · Orange = current search results · Projection recomputed on every insert/search.
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = "http://localhost:8080";
+
+// Client-side mirror of what's in the backend. The backend only returns
+// id/label/score from /search (not raw vector values), so we keep our own
+// copy of {id, label, values} locally, purely so we have the raw numbers
+// needed to compute the PCA projection for the scatter plot.
+let localStore = [];
+let highlightedIds = new Set();
+
+function setStatus(elId, msg, type) {
+  const el = document.getElementById(elId);
+  el.textContent = msg;
+  el.className = "status" + (type ? " " + type : "");
+}
+
+function parseValues(str) {
+  const parts = str.split(",").map(s => s.trim()).filter(s => s.length > 0);
+  const nums = parts.map(Number);
+  if (nums.length === 0 || nums.some(isNaN)) {
+    throw new Error("Enter comma-separated numbers, e.g. 0.9, 0.8, 0.1, 0.1");
+  }
+  return nums;
+}
+
+async function refreshCount() {
+  try {
+    const res = await fetch(API_BASE + "/count");
+    const data = await res.json();
+    document.getElementById("countBadge").textContent = data.count + " vectors";
+  } catch (e) {
+    document.getElementById("countBadge").textContent = "backend offline";
+  }
+}
+
+async function doInsert() {
+  const label = document.getElementById("insertLabel").value.trim();
+  const valuesStr = document.getElementById("insertValues").value;
+
+  try {
+    if (!label) throw new Error("Label is required");
+    const values = parseValues(valuesStr);
+
+    const res = await fetch(API_BASE + "/insert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, values })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Insert failed");
+
+    localStore.push({ id: data.id, label, values });
+    setStatus("insertStatus", `Inserted [${data.id}] ${label}`, "success");
+    document.getElementById("insertLabel").value = "";
+    document.getElementById("insertValues").value = "";
+
+    await refreshCount();
+    drawPlot();
+  } catch (e) {
+    setStatus("insertStatus", e.message, "error");
+  }
+}
+
+async function doSearch() {
+  const valuesStr = document.getElementById("searchValues").value;
+  const k = parseInt(document.getElementById("searchK").value) || 3;
+
+  try {
+    const values = parseValues(valuesStr);
+
+    const res = await fetch(API_BASE + "/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values, k })
+    });
+    const results = await res.json();
+    if (!res.ok) throw new Error(results.error || "Search failed");
+
+    setStatus("searchStatus", `Found ${results.length} result(s)`, "success");
+    renderResults(results);
+
+    highlightedIds = new Set(results.map(r => r.id));
+    drawPlot();
+  } catch (e) {
+    setStatus("searchStatus", e.message, "error");
+  }
+}
+
+function renderResults(results) {
+  const container = document.getElementById("resultsList");
+  container.innerHTML = "";
+  for (const r of results) {
+    const div = document.createElement("div");
+    div.className = "result-item";
+    div.innerHTML = `<span>[${r.id}] ${r.label}</span><span class="score">${r.score.toFixed(4)}</span>`;
+    container.appendChild(div);
+  }
+}
+
+async function loadSampleData() {
+  const samples = [
+    ["CS",     [0.9, 0.8, 0.1, 0.1]],
+    ["Math",   [0.85, 0.75, 0.15, 0.05]],
+    ["Food",   [0.1, 0.1, 0.9, 0.8]],
+    ["Sports", [0.2, 0.1, 0.1, 0.9]],
+    ["Art",    [0.3, 0.6, 0.4, 0.2]],
+  ];
+  for (const [label, values] of samples) {
+    const res = await fetch(API_BASE + "/insert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, values })
+    });
+    const data = await res.json();
+    localStore.push({ id: data.id, label, values });
+  }
+  setStatus("insertStatus", "Loaded 5 sample vectors", "success");
+  await refreshCount();
+  drawPlot();
+}
+
+// ============================================================
+// PCA (power iteration), verified against NumPy before writing this up
+// ============================================================
+
+function mean(vectors) {
+  const dim = vectors[0].length;
+  const m = new Array(dim).fill(0);
+  for (const v of vectors) for (let i = 0; i < dim; i++) m[i] += v[i];
+  for (let i = 0; i < dim; i++) m[i] /= vectors.length;
+  return m;
+}
+function centerData(vectors, meanVec) {
+  return vectors.map(v => v.map((x, i) => x - meanVec[i]));
+}
+function covarianceMatrix(centered) {
+  const dim = centered[0].length;
+  const n = centered.length;
+  const cov = Array.from({ length: dim }, () => new Array(dim).fill(0));
+  for (const v of centered) {
+    for (let i = 0; i < dim; i++) {
+      for (let j = 0; j < dim; j++) cov[i][j] += v[i] * v[j];
+    }
+  }
+  for (let i = 0; i < dim; i++) for (let j = 0; j < dim; j++) cov[i][j] /= Math.max(n - 1, 1);
+  return cov;
+}
+function matVecMul(mat, vec) {
+  return mat.map(row => row.reduce((sum, val, i) => sum + val * vec[i], 0));
+}
+function vecNorm(v) { return Math.sqrt(v.reduce((s, x) => s + x * x, 0)); }
+function normalize(v) { const n = vecNorm(v) || 1; return v.map(x => x / n); }
+function dot(a, b) { return a.reduce((s, x, i) => s + x * b[i], 0); }
+
+function powerIteration(mat, iterations = 100) {
+  const dim = mat.length;
+  let v = new Array(dim).fill(0).map(() => Math.random());
+  v = normalize(v);
+  for (let iter = 0; iter < iterations; iter++) {
+    v = matVecMul(mat, v);
+    v = normalize(v);
+  }
+  const eigenvalue = dot(v, matVecMul(mat, v));
+  return { vector: v, value: eigenvalue };
+}
+function deflate(mat, eigVec, eigVal) {
+  const dim = mat.length;
+  const newMat = Array.from({ length: dim }, () => new Array(dim).fill(0));
+  for (let i = 0; i < dim; i++)
+    for (let j = 0; j < dim; j++)
+      newMat[i][j] = mat[i][j] - eigVal * eigVec[i] * eigVec[j];
+  return newMat;
+}
+function pca2D(vectors) {
+  if (vectors.length < 2) return vectors.map(() => [0, 0]);
+  const m = mean(vectors);
+  const centered = centerData(vectors, m);
+  const cov = covarianceMatrix(centered);
+  const pc1 = powerIteration(cov);
+  const deflated = deflate(cov, pc1.vector, pc1.value);
+  const pc2 = powerIteration(deflated);
+  return centered.map(v => [dot(v, pc1.vector), dot(v, pc2.vector)]);
+}
+
+// ============================================================
+// Canvas drawing
+// ============================================================
+
+function drawPlot() {
+  const canvas = document.getElementById("plot");
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  if (localStore.length === 0) return;
+
+  const vectors = localStore.map(v => v.values);
+  const points2D = pca2D(vectors);
+
+  const xs = points2D.map(p => p[0]);
+  const ys = points2D.map(p => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 40;
+
+  function toScreen(x, y) {
+    const sx = pad + ((x - minX) / (maxX - minX || 1)) * (rect.width - 2 * pad);
+    const sy = rect.height - pad - ((y - minY) / (maxY - minY || 1)) * (rect.height - 2 * pad);
+    return [sx, sy];
+  }
+
+  localStore.forEach((item, i) => {
+    const [sx, sy] = toScreen(points2D[i][0], points2D[i][1]);
+    const isHighlighted = highlightedIds.has(item.id);
+
+    ctx.beginPath();
+    ctx.arc(sx, sy, isHighlighted ? 8 : 6, 0, Math.PI * 2);
+    ctx.fillStyle = isHighlighted ? "#f4a261" : "#6ea8fe";
+    ctx.fill();
+
+    ctx.font = "11px sans-serif";
+    ctx.fillStyle = "#e4e6eb";
+    ctx.fillText(item.label, sx + 10, sy + 4);
+  });
+}
+
+// Initial load
+refreshCount();
+window.addEventListener("resize", drawPlot);
+</script>
+
+</body>
+</html>
