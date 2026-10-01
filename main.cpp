@@ -1,7 +1,5 @@
 // main.cpp
-// Day 7: Days 1-2 engine (VectorStore) wrapped in a REST API using cpp-httplib + nlohmann/json
-// (KDTree/HNSWIndex from Days 3-6 intentionally left out today for clarity — see Interview Q7
-//  below for exactly how you'd wire them back in as a follow-up exercise.)
+// Day 9: Day 7's REST API extended with real embeddings via Ollama (local, free)
 
 #include <iostream>
 #include <vector>
@@ -9,12 +7,8 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
-#include <memory>
-#include <limits>
-#include <random>
-#include <queue>
-#include <unordered_set>
 #include <mutex>
+
 #include "httplib.h"
 #include "json.hpp"
 using json = nlohmann::json;
@@ -78,16 +72,46 @@ public:
 };
 
 // ============================================================
-// REST API wiring (Day 7)
+// Day 9: Ollama embedding client
+// ============================================================
+
+// Calls Ollama's local /api/embed endpoint, returns the embedding vector for `text`.
+// Throws std::runtime_error with a clear message if Ollama isn't running or errors out.
+std::vector<float> getEmbedding(const std::string& text) {
+    httplib::Client cli("http://localhost:11434");
+    cli.set_connection_timeout(5);  // seconds — fail fast if Ollama isn't running
+    cli.set_read_timeout(30);       // embedding can take a moment on first call (model loading)
+
+    json requestBody = {
+        {"model", "nomic-embed-text"},
+        {"input", text}
+    };
+
+    auto res = cli.Post("/api/embed", requestBody.dump(), "application/json");
+
+    if (!res) {
+        throw std::runtime_error("Could not reach Ollama at localhost:11434 — is it running? Try: ollama serve");
+    }
+    if (res->status != 200) {
+        throw std::runtime_error("Ollama returned status " + std::to_string(res->status) + ": " + res->body);
+    }
+
+    json responseBody = json::parse(res->body);
+    // Ollama's /api/embed response shape: { "embeddings": [[0.1, 0.2, ...]] }
+    std::vector<float> embedding = responseBody.at("embeddings")[0].get<std::vector<float>>();
+    return embedding;
+}
+
+// ============================================================
+// REST API wiring
 // ============================================================
 
 int main() {
     VectorStore store;
-    std::mutex storeMutex;  // protects store across concurrent HTTP requests
+    std::mutex storeMutex;
 
     httplib::Server svr;
 
-    // Allow the frontend (Day 8) to call this from a browser
     svr.set_default_headers({
         {"Access-Control-Allow-Origin", "*"},
         {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
@@ -97,12 +121,11 @@ int main() {
         res.status = 200;
     });
 
-    // GET /health — simple liveness check
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
     });
 
-    // POST /insert  { "label": "...", "values": [0.1, 0.2, ...] }
+    // Day 7: insert with pre-computed values (still works, e.g. for testing)
     svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
@@ -121,15 +144,40 @@ int main() {
         }
     });
 
-    // POST /search  { "values": [0.1, 0.2, ...], "k": 5 }
-    svr.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
+    // Day 9: NEW — insert raw text, server computes the real embedding via Ollama
+    // { "label": "...", "text": "A sentence to embed" }
+    svr.Post("/embed-insert", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
-            std::vector<float> query = body.at("values").get<std::vector<float>>();
-            int k = body.value("k", 5);
+            std::string label = body.at("label").get<std::string>();
+            std::string text = body.at("text").get<std::string>();
+
+            std::vector<float> embedding = getEmbedding(text);  // calls Ollama
 
             std::lock_guard<std::mutex> lock(storeMutex);
-            auto results = store.bruteForceSearch(query, k);
+            int id = store.insert(label, embedding);
+
+            json response = {{"id", id}, {"label", label}, {"dimensions", embedding.size()}, {"status", "inserted"}};
+            res.set_content(response.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            json err = {{"error", e.what()}};
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    // Day 9: NEW — search with raw text, server embeds the query then searches
+    // { "text": "query text", "k": 5 }
+    svr.Post("/embed-search", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto body = json::parse(req.body);
+            std::string text = body.at("text").get<std::string>();
+            int k = body.value("k", 5);
+
+            std::vector<float> queryEmbedding = getEmbedding(text);  // calls Ollama
+
+            std::lock_guard<std::mutex> lock(storeMutex);
+            auto results = store.bruteForceSearch(queryEmbedding, k);
 
             json response = json::array();
             for (const auto& r : results) {
@@ -137,25 +185,21 @@ int main() {
             }
             res.set_content(response.dump(), "application/json");
         } catch (const std::exception& e) {
-            res.status = 400;
+            res.status = 500;
             json err = {{"error", e.what()}};
             res.set_content(err.dump(), "application/json");
         }
     });
 
-    // DELETE /delete/:id
     svr.Delete(R"(/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
         int id = std::stoi(req.matches[1]);
-
         std::lock_guard<std::mutex> lock(storeMutex);
         bool found = store.remove(id);
-
         json response = {{"id", id}, {"deleted", found}};
         res.status = found ? 200 : 404;
         res.set_content(response.dump(), "application/json");
     });
 
-    // GET /count — how many vectors are currently stored
     svr.Get("/count", [&](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(storeMutex);
         json response = {{"count", store.size()}};
@@ -163,6 +207,7 @@ int main() {
     });
 
     std::cout << "Server starting on http://localhost:8080\n";
+    std::cout << "Make sure Ollama is running (ollama serve) with nomic-embed-text pulled.\n";
     svr.listen("0.0.0.0", 8080);
 
     return 0;
