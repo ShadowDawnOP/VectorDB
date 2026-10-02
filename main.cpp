@@ -1,5 +1,6 @@
 // main.cpp
-// Day 9: Day 7's REST API extended with real embeddings via Ollama (local, free)
+// Day 10: Day 9's embedding engine extended into a full RAG pipeline
+// (retrieval via embeddings + generation via a local Ollama chat model)
 
 #include <iostream>
 #include <vector>
@@ -8,21 +9,25 @@
 #include <algorithm>
 #include <stdexcept>
 #include <mutex>
+#include <sstream>
 
 #include "httplib.h"
 #include "json.hpp"
 using json = nlohmann::json;
 
 // ============================================================
-// Day 1-2: VectorItem, distance metrics, VectorStore (brute-force)
+// Day 1-2 + Day 9: VectorItem now also stores the original text
+// (needed for RAG — search gives us WHICH chunk matched, but we need
+//  the chunk's actual content to hand to the LLM as context)
 // ============================================================
 
 struct VectorItem {
     int id;
     std::string label;
+    std::string text;        // NEW (Day 10): the original source text this vector represents
     std::vector<float> values;
-    VectorItem(int id_, std::string label_, std::vector<float> values_)
-        : id(id_), label(std::move(label_)), values(std::move(values_)) {}
+    VectorItem(int id_, std::string label_, std::string text_, std::vector<float> values_)
+        : id(id_), label(std::move(label_)), text(std::move(text_)), values(std::move(values_)) {}
 };
 
 float dotProduct(const std::vector<float>& a, const std::vector<float>& b) {
@@ -38,16 +43,16 @@ float cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b)
     return dotProduct(a, b) / (magA * magB);
 }
 
-struct SearchResult { int id; std::string label; float score; };
+struct SearchResult { int id; std::string label; std::string text; float score; };
 
 class VectorStore {
 private:
     std::vector<VectorItem> items;
     int nextId = 0;
 public:
-    int insert(const std::string& label, const std::vector<float>& values) {
+    int insert(const std::string& label, const std::string& text, const std::vector<float>& values) {
         int id = nextId++;
-        items.emplace_back(id, label, values);
+        items.emplace_back(id, label, text, values);
         return id;
     }
     size_t size() const { return items.size(); }
@@ -62,7 +67,7 @@ public:
         std::vector<SearchResult> results;
         results.reserve(items.size());
         for (const auto& item : items) {
-            results.push_back({item.id, item.label, cosineSimilarity(query, item.values)});
+            results.push_back({item.id, item.label, item.text, cosineSimilarity(query, item.values)});
         }
         std::sort(results.begin(), results.end(),
                   [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
@@ -72,21 +77,15 @@ public:
 };
 
 // ============================================================
-// Day 9: Ollama embedding client
+// Day 9: Ollama embedding client (unchanged)
 // ============================================================
 
-// Calls Ollama's local /api/embed endpoint, returns the embedding vector for `text`.
-// Throws std::runtime_error with a clear message if Ollama isn't running or errors out.
 std::vector<float> getEmbedding(const std::string& text) {
     httplib::Client cli("http://localhost:11434");
-    cli.set_connection_timeout(5);  // seconds — fail fast if Ollama isn't running
-    cli.set_read_timeout(30);       // embedding can take a moment on first call (model loading)
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(30);
 
-    json requestBody = {
-        {"model", "nomic-embed-text"},
-        {"input", text}
-    };
-
+    json requestBody = {{"model", "nomic-embed-text"}, {"input", text}};
     auto res = cli.Post("/api/embed", requestBody.dump(), "application/json");
 
     if (!res) {
@@ -97,9 +96,53 @@ std::vector<float> getEmbedding(const std::string& text) {
     }
 
     json responseBody = json::parse(res->body);
-    // Ollama's /api/embed response shape: { "embeddings": [[0.1, 0.2, ...]] }
-    std::vector<float> embedding = responseBody.at("embeddings")[0].get<std::vector<float>>();
-    return embedding;
+    return responseBody.at("embeddings")[0].get<std::vector<float>>();
+}
+
+// ============================================================
+// Day 10: Ollama generation client — the "G" in RAG
+// ============================================================
+
+// Calls Ollama's /api/generate endpoint with a chat model, returns the generated answer text.
+// `prompt` should already contain the retrieved context + the user's question, assembled by the caller.
+std::string generateAnswer(const std::string& prompt) {
+    httplib::Client cli("http://localhost:11434");
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(120);  // generation is slower than embedding — give it real time, especially on CPU
+
+    json requestBody = {
+        {"model", "llama3.2"},   // small, free, runs on CPU — swap for any chat model you've pulled
+        {"prompt", prompt},
+        {"stream", false}        // simpler to handle one full response than a streamed one, for now
+    };
+
+    auto res = cli.Post("/api/generate", requestBody.dump(), "application/json");
+
+    if (!res) {
+        throw std::runtime_error("Could not reach Ollama at localhost:11434 — is it running? Try: ollama serve");
+    }
+    if (res->status != 200) {
+        throw std::runtime_error("Ollama returned status " + std::to_string(res->status) + ": " + res->body);
+    }
+
+    json responseBody = json::parse(res->body);
+    return responseBody.at("response").get<std::string>();
+}
+
+// Builds the actual prompt sent to the LLM: retrieved context chunks + instructions + the question.
+// This is the "prompt engineering" piece of RAG — how you frame this matters a lot for answer quality.
+std::string buildRagPrompt(const std::vector<SearchResult>& retrievedChunks, const std::string& question) {
+    std::ostringstream prompt;
+    prompt << "You are a helpful assistant. Answer the question using ONLY the context below. "
+           << "If the context doesn't contain the answer, say you don't know — do not make something up.\n\n";
+
+    prompt << "Context:\n";
+    for (const auto& chunk : retrievedChunks) {
+        prompt << "- (" << chunk.label << ") " << chunk.text << "\n";
+    }
+
+    prompt << "\nQuestion: " << question << "\nAnswer:";
+    return prompt.str();
 }
 
 // ============================================================
@@ -125,37 +168,17 @@ int main() {
         res.set_content(R"({"status":"ok"})", "application/json");
     });
 
-    // Day 7: insert with pre-computed values (still works, e.g. for testing)
-    svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
-        try {
-            auto body = json::parse(req.body);
-            std::string label = body.at("label").get<std::string>();
-            std::vector<float> values = body.at("values").get<std::vector<float>>();
-
-            std::lock_guard<std::mutex> lock(storeMutex);
-            int id = store.insert(label, values);
-
-            json response = {{"id", id}, {"label", label}, {"status", "inserted"}};
-            res.set_content(response.dump(), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            json err = {{"error", e.what()}};
-            res.set_content(err.dump(), "application/json");
-        }
-    });
-
-    // Day 9: NEW — insert raw text, server computes the real embedding via Ollama
-    // { "label": "...", "text": "A sentence to embed" }
+    // Insert raw text; server embeds it via Ollama and stores both the vector AND the original text
     svr.Post("/embed-insert", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
             std::string label = body.at("label").get<std::string>();
             std::string text = body.at("text").get<std::string>();
 
-            std::vector<float> embedding = getEmbedding(text);  // calls Ollama
+            std::vector<float> embedding = getEmbedding(text);
 
             std::lock_guard<std::mutex> lock(storeMutex);
-            int id = store.insert(label, embedding);
+            int id = store.insert(label, text, embedding);
 
             json response = {{"id", id}, {"label", label}, {"dimensions", embedding.size()}, {"status", "inserted"}};
             res.set_content(response.dump(), "application/json");
@@ -166,15 +189,13 @@ int main() {
         }
     });
 
-    // Day 9: NEW — search with raw text, server embeds the query then searches
-    // { "text": "query text", "k": 5 }
     svr.Post("/embed-search", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
             std::string text = body.at("text").get<std::string>();
             int k = body.value("k", 5);
 
-            std::vector<float> queryEmbedding = getEmbedding(text);  // calls Ollama
+            std::vector<float> queryEmbedding = getEmbedding(text);
 
             std::lock_guard<std::mutex> lock(storeMutex);
             auto results = store.bruteForceSearch(queryEmbedding, k);
@@ -183,6 +204,53 @@ int main() {
             for (const auto& r : results) {
                 response.push_back({{"id", r.id}, {"label", r.label}, {"score", r.score}});
             }
+            res.set_content(response.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            json err = {{"error", e.what()}};
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    // Day 10: NEW — the full RAG endpoint. { "question": "...", "k": 3 }
+    svr.Post("/doc/ask", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto body = json::parse(req.body);
+            std::string question = body.at("question").get<std::string>();
+            int k = body.value("k", 3);
+
+            // Cheap check FIRST: if nothing's stored, don't bother calling Ollama at all
+            {
+                std::lock_guard<std::mutex> lock(storeMutex);
+                if (store.size() == 0) {
+                    json response = {{"answer", "No documents have been inserted yet — nothing to search."}, {"sources", json::array()}};
+                    res.set_content(response.dump(), "application/json");
+                    return;
+                }
+            }
+
+            // 1. RETRIEVE: embed the question, search for the most relevant stored chunks
+            std::vector<float> questionEmbedding = getEmbedding(question);
+
+            std::vector<SearchResult> retrieved;
+            {
+                std::lock_guard<std::mutex> lock(storeMutex);
+                retrieved = store.bruteForceSearch(questionEmbedding, k);
+            }
+
+            // 2. AUGMENT: build a prompt combining the retrieved context with the question
+            std::string prompt = buildRagPrompt(retrieved, question);
+
+            // 3. GENERATE: send the augmented prompt to the LLM
+            std::string answer = generateAnswer(prompt);
+
+            // Return both the answer AND which sources were used — critical for trust/verification
+            json sources = json::array();
+            for (const auto& r : retrieved) {
+                sources.push_back({{"id", r.id}, {"label", r.label}, {"score", r.score}});
+            }
+
+            json response = {{"answer", answer}, {"sources", sources}};
             res.set_content(response.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 500;
@@ -207,7 +275,7 @@ int main() {
     });
 
     std::cout << "Server starting on http://localhost:8080\n";
-    std::cout << "Make sure Ollama is running (ollama serve) with nomic-embed-text pulled.\n";
+    std::cout << "Requires Ollama running with nomic-embed-text (embeddings) and llama3.2 (generation).\n";
     svr.listen("0.0.0.0", 8080);
 
     return 0;
